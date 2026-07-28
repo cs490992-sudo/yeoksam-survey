@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="역삼 조사 임시 아이콘">
+  <rect width="512" height="512" rx="112" fill="#4c3b78"/>
+  <circle cx="256" cy="256" r="150" fill="#eee8ff"/>
+  <path d="M170 260l55 55 120-130" fill="none" stroke="#4c3b78" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
