@@ -1,19 +1,17 @@
-# 향후 데이터 모델 계획
+# 조사 데이터 모델
 
-> 설계 검토용 문서입니다. 이 단계에서는 SQL 또는 migration을 만들거나 실행하지 않습니다.
+실제 정의는 `supabase/migrations/001_survey_core.sql`에 있으며 운영 적용 전 검토합니다.
 
-## 예상 테이블
+- `survey_projects` 1 — N `survey_rounds` (단회는 single, 비교조사는 pre/post)
+- `survey_projects` 1 — N `survey_questions` 1 — N `survey_question_options`
+- `survey_projects` 1 — N `survey_participants`
+- `survey_rounds` 1 — N `survey_submissions` 1 — N `survey_answers`
+- `survey_answers` N — M `survey_question_options` (`survey_answer_options`)
 
-- survey_projects: 조사 정의와 유형
-- survey_rounds: 단회·사전·사후 회차와 기간
-- survey_questions: 문항과 응답 유형
-- survey_question_options: 선택형 문항 보기
-- survey_participants: 회차별 참여 대상
-- survey_submissions: 이용인의 제출·완료 상태
-- survey_answers: 문항별 응답
+프로젝트 삭제는 모든 조사 자식에 cascade됩니다. 질문은 회차별로 복제하지 않고 프로젝트에서 공유합니다. 순서와 참여자/제출/답변 중복은 unique 제약으로 방지합니다. updated_at이 있는 다섯 테이블에는 조사 전용 trigger가 적용됩니다.
 
-모든 조사 리소스는 organization_id를 가져 기관 사이 데이터를 분리합니다. 기존 profiles의 사용자·역할·기관 정보와 연결하고, 기존 clients, programs는 식별자 참조를 우선 검토하여 이용인·프로그램 정보를 중복 저장하지 않습니다.
+모든 조사 테이블은 RLS를 사용합니다. 활성 admin/staff만 profiles의 동일 organization_id에 속한 프로젝트와 자식을 조회·관리하며, 프로젝트 영구 삭제는 admin만 가능합니다. 자식 정책은 항상 프로젝트까지 join합니다.
 
-survey_projects 하나에 단회 또는 사전·사후 survey_rounds를 연결합니다. 사전·사후는 같은 문항 버전을 사용하도록 고정하는 방안을 검토합니다. 참여자·회차 조합과 제출 제약으로 중복 응답을 막고, 완료 후 수정은 권한, 사유, 감사 기록을 요구하도록 설계합니다.
+## 공유 데이터 가정
 
-영구 삭제는 관리자에게도 제한하고 보관·비활성화를 기본으로 합니다. 조직 분리, 역할별 읽기/쓰기, 사진 및 개인정보 접근을 위해 모든 테이블에 RLS가 필요합니다. 실제 제약조건, 정책, SQL은 다음 작업에서 기존 schema와 권한을 확인한 뒤 별도 검토하여 생성합니다.
+adapter는 `profiles(id, organization_id, role, is_active)`, `clients(id, organization_id, name, photo_path, is_active)`, `programs(id, organization_id, name, is_active)`와 UUID 식별자를 가정합니다. 운영 구조를 확인하지 못했으므로 migration은 clients/programs를 변경하거나 FK를 추가하지 않습니다. 사진 Storage URL 규칙도 가정하지 않아 현재 선택 카드에는 이름 fallback만 표시합니다.

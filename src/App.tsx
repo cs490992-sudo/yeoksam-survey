@@ -4,13 +4,14 @@ import { AdminRoute, ProtectedRoute } from './components/ProtectedRoute'
 import { AppShell } from './components/AppShell'
 import { LoginPage } from './pages/LoginPage'
 import { ClientPhotos, Completion, Dashboard, NewSurvey, NotFound, PrintReport, Reports, Search, SurveyList, SurveyRun } from './pages/Pages'
+import { SurveyEditor } from './pages/SurveyEditor'
 
 export default function App() {
   return <BrowserRouter><AuthProvider><Routes>
     <Route path="/login" element={<LoginPage />} />
     <Route element={<ProtectedRoute />}><Route element={<AppShell />}>
-      <Route index element={<Dashboard />} /><Route path="/admin/new" element={<NewSurvey />} />
-      <Route path="/surveys" element={<SurveyList />} /><Route path="/surveys/run" element={<SurveyRun />} />
+      <Route index element={<Dashboard />} /><Route path="/admin/new" element={<SurveyEditor />} />
+      <Route path="/surveys" element={<SurveyList />} /><Route path="/surveys/:surveyId/edit" element={<SurveyEditor />} /><Route path="/surveys/run" element={<SurveyRun />} />
       <Route path="/surveys/completion" element={<Completion />} /><Route path="/surveys/search" element={<Search />} />
       <Route path="/reports" element={<Reports />} /><Route path="/reports/print" element={<PrintReport />} />
       <Route element={<AdminRoute />}><Route path="/admin/client-photos" element={<ClientPhotos />} /></Route>
