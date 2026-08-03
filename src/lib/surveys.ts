@@ -1,5 +1,5 @@
 import { getSupabase } from './supabase'
-import type { LoadedSurvey, RunParticipant, RunQuestion, RunSurvey, SavedAnswer, SharedClient, SharedProgram, SurveyDraft, SurveyListItem, SurveyStatus } from '../types/survey'
+import type { LoadedSurvey, RunParticipant, RunQuestion, RunSurvey, SavedAnswer, SharedClient, SharedProgram, SubmissionDetails, SubmissionRevision, SurveyDraft, SurveyListItem, SurveyStatus } from '../types/survey'
 
 const friendlyError = '조사 정보를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 const db = () => { const client = getSupabase(); if (!client) throw new Error('Supabase 연결 설정을 확인해 주세요.'); return client }
@@ -176,7 +176,7 @@ export async function deleteSurvey(id:string, organizationId:string) { const {er
 const runFailure = (stage: string, message: string) => { console.error(`[survey-run] failed at ${stage}`); throw new Error(message) }
 
 export async function listRunnableSurveys(organizationId: string): Promise<RunSurvey[]> {
-  const { data, error } = await db().from('survey_projects').select('id,title,survey_type,program_id,starts_at,survey_rounds(id,round_type,status,starts_at),survey_participants(count)').eq('organization_id', organizationId).eq('status', 'open').order('starts_at', { ascending: false })
+  const { data, error } = await db().from('survey_projects').select('id,title,survey_type,status,program_id,starts_at,survey_rounds(id,round_type,status,starts_at),survey_participants(count)').eq('organization_id', organizationId).in('status', ['open','closed','archived']).order('starts_at', { ascending: false })
   if (error) return runFailure('load-surveys', '진행 중인 조사 목록을 불러오지 못했습니다.')
   const rows = data ?? []; const programIds = rows.flatMap(r => r.program_id ? [r.program_id] : [])
   const [{ data: programs }, { data: submissions, error: submissionError }] = await Promise.all([
@@ -186,9 +186,9 @@ export async function listRunnableSurveys(organizationId: string): Promise<RunSu
   if (submissionError) return runFailure('load-surveys', '완료 현황을 불러오지 못했습니다.')
   const names = new Map((programs ?? []).map(p => [p.id, p.name])); const completed = new Map<string, number>()
   for (const s of submissions ?? []) completed.set(s.survey_round_id, (completed.get(s.survey_round_id) ?? 0) + 1)
-  return rows.filter(r => r.survey_rounds.some(round => round.status === 'open')).map(r => {
-    const open = r.survey_rounds.filter(round => round.status === 'open')
-    return { id:r.id,title:r.title,survey_type:r.survey_type,program_name:r.program_id?names.get(r.program_id)??null:null,starts_at:r.starts_at,participant_count:r.survey_participants[0]?.count??0,completed_count:open.length===1?completed.get(open[0].id)??0:0,rounds:r.survey_rounds }
+  return rows.filter(r => r.survey_rounds.some(round => round.status === 'open' || round.status === 'closed')).map(r => {
+    const active = r.survey_rounds.find(round => round.status === 'open') ?? r.survey_rounds.find(round => round.status === 'closed')
+    return { id:r.id,title:r.title,survey_type:r.survey_type,status:r.status,program_name:r.program_id?names.get(r.program_id)??null:null,starts_at:r.starts_at,participant_count:r.survey_participants[0]?.count??0,completed_count:active?completed.get(active.id)??0:0,rounds:r.survey_rounds }
   }) as RunSurvey[]
 }
 
@@ -229,4 +229,33 @@ export async function saveRunAnswer(submissionId:string, answer:SavedAnswer) {
 }
 export async function submitRun(submissionId:string) {
   const { data,error }=await db().rpc('submit_survey_submission',{p_submission_id:submissionId}); if(error||!data?.[0])return runFailure('submit-submission','필수 응답을 확인하거나 잠시 후 다시 시도해 주세요.'); return data[0]
+}
+
+export async function loadSubmissionDetails(submissionId:string):Promise<SubmissionDetails>{
+  const {data,error}=await db().from('survey_submissions').select('id,status,submitted_at,submitted_by,last_edited_at,last_edited_by,edit_count').eq('id',submissionId).eq('status','submitted').single()
+  if(error||!data)return runFailure('load-submission','완료 응답 정보를 불러오지 못했습니다.')
+  return {...data,submitted_by_name:null,last_edited_by_name:null} as SubmissionDetails
+}
+
+export async function loadSubmissionRevisions(submissionId:string):Promise<SubmissionRevision[]>{
+  const {data,error}=await db().from('survey_submission_revisions').select('id,edited_at,edited_by,edit_reason,revision_number,previous_answers').eq('survey_submission_id',submissionId).order('revision_number',{ascending:false})
+  if(error)return runFailure('load-revisions','수정 이력을 불러오지 못했습니다.')
+  return (data??[]).map(r=>({...r,edited_by_name:null,previous_answers:(r.previous_answers as (SavedAnswer&{staff_note?:string|null})[]).map(a=>({...a,text_value:a.staff_note??a.text_value,option_ids:a.option_ids??[]}))})) as SubmissionRevision[]
+}
+
+export async function reviseSubmission(submissionId:string,answers:SavedAnswer[],reason:string){
+  const payload=answers.filter(answer=>{
+    const hasNumeric=answer.numeric_value!==null&&answer.numeric_value!==undefined
+    const hasText=typeof answer.text_value==='string'&&answer.text_value.trim().length>0
+    const hasOptions=Array.isArray(answer.option_ids)&&answer.option_ids.length>0
+    return hasNumeric||hasText||hasOptions
+  }).map(answer=>({
+    question_id:answer.question_id,
+    numeric_value:answer.numeric_value??null,
+    text_value:typeof answer.text_value==='string'&&answer.text_value.trim().length>0?answer.text_value.trim():null,
+    option_ids:Array.isArray(answer.option_ids)?answer.option_ids:[],
+  }))
+  const {data,error}=await db().rpc('revise_survey_submission',{p_submission_id:submissionId,p_answers:payload,p_edit_reason:reason.trim()||null})
+  if(error||!data?.[0])return runFailure('revise-submission','완료 응답을 수정하지 못했습니다. 조사 상태와 필수 응답을 확인해 주세요.')
+  return data[0]
 }
