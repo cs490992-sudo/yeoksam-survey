@@ -3,6 +3,11 @@ import type { LoadedSurvey, SharedClient, SharedProgram, SurveyDraft, SurveyList
 
 const friendlyError = '조사 정보를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 const db = () => { const client = getSupabase(); if (!client) throw new Error('Supabase 연결 설정을 확인해 주세요.'); return client }
+type SaveStage = 'create-project' | 'save-rounds' | 'save-questions' | 'save-options' | 'save-participants' | 'open-project' | 'open-round'
+
+function logSaveFailure(stage: SaveStage) {
+  console.error(`[survey-save] failed at ${stage}`)
+}
 
 export async function loadSharedData(organizationId: string) {
   const client = db()
@@ -23,28 +28,132 @@ export async function listSurveys(organizationId: string): Promise<SurveyListIte
   return rows.map((row) => ({ ...row, participant_count: row.survey_participants?.[0]?.count ?? 0, question_count: row.survey_questions?.[0]?.count ?? 0, program_name: row.program_id ? names.get(row.program_id) ?? null : null })) as SurveyListItem[]
 }
 
-export async function saveSurvey(draft: SurveyDraft, organizationId: string, start: boolean, existingId?: string) {
-  const client = db(); const now = new Date().toISOString(); let projectId = existingId; let created = false
+async function saveDraftStructure(draft: SurveyDraft, organizationId: string, existingId?: string) {
+  const client = db()
+  let projectId = existingId
+  let created = false
+  let stage: SaveStage = 'create-project'
+
   try {
-    const project = { organization_id: organizationId, program_id: draft.program_id || null, title: draft.title.trim(), description: draft.description.trim() || null, survey_type: draft.survey_type, template_key: draft.template_key, status: start ? 'open' : 'draft', starts_at: start ? now : null }
+    const project = {
+      organization_id: organizationId,
+      program_id: draft.program_id || null,
+      title: draft.title.trim(),
+      description: draft.description.trim() || null,
+      survey_type: draft.survey_type,
+      template_key: draft.template_key,
+      status: 'draft' as const,
+      starts_at: null,
+    }
+
     if (existingId) {
-      const { error } = await client.from('survey_projects').update(project).eq('id', existingId).eq('organization_id', organizationId).eq('status', 'draft'); if (error) throw error
-      for (const table of ['survey_participants', 'survey_question_options', 'survey_questions', 'survey_rounds']) { if (table === 'survey_question_options') continue; const { error: deleteError } = await client.from(table).delete().eq('survey_project_id', existingId); if (deleteError) throw deleteError }
+      const { data, error } = await client.from('survey_projects').update(project).eq('id', existingId).eq('organization_id', organizationId).eq('status', 'draft').select('id').single()
+      if (error || !data) throw error ?? new Error('Draft project was not updated')
+
+      for (const table of ['survey_participants', 'survey_questions', 'survey_rounds'] as const) {
+        const { error: deleteError } = await client.from(table).delete().eq('survey_project_id', existingId)
+        if (deleteError) throw deleteError
+      }
     } else {
-      const { data, error } = await client.from('survey_projects').insert(project).select('id').single(); if (error || !data) throw error; projectId = data.id; created = true
+      const { data, error } = await client.from('survey_projects').insert(project).select('id').single()
+      if (error || !data) throw error ?? new Error('Draft project was not created')
+      projectId = data.id
+      created = true
     }
-    const rounds = draft.survey_type === 'single' ? [{ survey_project_id: projectId, round_type: 'single', status: start ? 'open' : 'pending', starts_at: start ? now : null }] : [{ survey_project_id: projectId, round_type: 'pre', status: start ? 'open' : 'pending', starts_at: start ? now : null }, { survey_project_id: projectId, round_type: 'post', status: 'pending' }]
-    if ((await client.from('survey_rounds').insert(rounds)).error) throw new Error()
-    for (let index = 0; index < draft.questions.length; index++) {
-      const q = draft.questions[index]; const { data: saved, error } = await client.from('survey_questions').insert({ survey_project_id: projectId, domain: q.domain.trim() || null, question_text: q.question_text.trim(), response_type: q.response_type, sort_order: index + 1, is_required: q.is_required }).select('id').single(); if (error || !saved) throw error
-      if (q.response_type === 'single_choice' || q.response_type === 'multiple_choice') { const options = q.options.map((o, i) => ({ survey_question_id: saved.id, label: o.label.trim(), numeric_value: o.numeric_value ?? null, sort_order: i + 1 })); if ((await client.from('survey_question_options').insert(options)).error) throw new Error() }
+    if (!projectId) throw new Error('Draft project id was not available')
+
+    stage = 'save-rounds'
+    const rounds = draft.survey_type === 'single'
+      ? [{ survey_project_id: projectId, round_type: 'single', status: 'pending' }]
+      : [
+          { survey_project_id: projectId, round_type: 'pre', status: 'pending' },
+          { survey_project_id: projectId, round_type: 'post', status: 'pending' },
+        ]
+    const { error: roundsError } = await client.from('survey_rounds').insert(rounds)
+    if (roundsError) throw roundsError
+
+    stage = 'save-questions'
+    const questionRows = draft.questions.map((question, index) => ({
+      survey_project_id: projectId,
+      domain: question.domain.trim() || null,
+      question_text: question.question_text.trim(),
+      response_type: question.response_type,
+      sort_order: index + 1,
+      is_required: question.is_required,
+    }))
+    const { data: savedQuestions, error: questionsError } = await client.from('survey_questions').insert(questionRows).select('id,sort_order')
+    if (questionsError || !savedQuestions || savedQuestions.length !== questionRows.length) throw questionsError ?? new Error('Questions were not saved')
+
+    stage = 'save-options'
+    const questionIds = new Map(savedQuestions.map((question) => [question.sort_order, question.id]))
+    const optionRows = draft.questions.flatMap((question, questionIndex) => {
+      if (question.response_type !== 'single_choice' && question.response_type !== 'multiple_choice') return []
+      const questionId = questionIds.get(questionIndex + 1)
+      if (!questionId) throw new Error('Saved question was not found')
+      return question.options.map((option, optionIndex) => ({
+        survey_question_id: questionId,
+        label: option.label.trim(),
+        numeric_value: option.numeric_value ?? null,
+        sort_order: optionIndex + 1,
+      }))
+    })
+    if (optionRows.length) {
+      const { error: optionsError } = await client.from('survey_question_options').insert(optionRows)
+      if (optionsError) throw optionsError
     }
-    if ((await client.from('survey_participants').insert(draft.participant_ids.map((client_id) => ({ survey_project_id: projectId, client_id })))).error) throw new Error()
-    return projectId!
+
+    stage = 'save-participants'
+    const participants = draft.participant_ids.map((client_id) => ({ survey_project_id: projectId, client_id }))
+    if (participants.length) {
+      const { error: participantsError } = await client.from('survey_participants').insert(participants)
+      if (participantsError) throw participantsError
+    }
+
+    return { projectId, created }
   } catch {
-    if (created && projectId) await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId)
+    logSaveFailure(stage)
+    if (created && projectId) {
+      const { error: cleanupError } = await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft')
+      if (cleanupError) console.error('[survey-save] failed to clean up new draft project')
+    }
     throw new Error(friendlyError)
   }
+}
+
+async function openSavedSurvey(projectId: string, organizationId: string, draft: SurveyDraft) {
+  const client = db()
+  const now = new Date().toISOString()
+  let stage: SaveStage = 'open-project'
+
+  try {
+    const { data, error } = await client.from('survey_projects').update({ status: 'open', starts_at: now }).eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft').select('id').single()
+    if (error || !data) throw error ?? new Error('Project was not opened')
+
+    stage = 'open-round'
+    const roundType = draft.survey_type === 'single' ? 'single' : 'pre'
+    const { data: round, error: roundError } = await client.from('survey_rounds').update({ status: 'open', starts_at: now }).eq('survey_project_id', projectId).eq('round_type', roundType).eq('status', 'pending').select('id').single()
+    if (roundError || !round) throw roundError ?? new Error('Round was not opened')
+  } catch {
+    logSaveFailure(stage)
+    throw new Error(friendlyError)
+  }
+}
+
+export async function saveSurvey(draft: SurveyDraft, organizationId: string, start: boolean, existingId?: string) {
+  const client = db()
+  const { projectId, created } = await saveDraftStructure(draft, organizationId, existingId)
+  if (start) {
+    try {
+      await openSavedSurvey(projectId, organizationId, draft)
+    } catch (error) {
+      if (created) {
+        const { error: cleanupError } = await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft')
+        if (cleanupError) console.error('[survey-save] failed to clean up new draft project')
+      }
+      throw error
+    }
+  }
+  return projectId
 }
 
 export async function loadSurvey(id: string, organizationId: string): Promise<LoadedSurvey> {
