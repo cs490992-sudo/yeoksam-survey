@@ -1,5 +1,5 @@
 import { getSupabase } from './supabase'
-import type { LoadedSurvey, SharedClient, SharedProgram, SurveyDraft, SurveyListItem, SurveyStatus } from '../types/survey'
+import type { LoadedSurvey, RunParticipant, RunQuestion, RunSurvey, SavedAnswer, SharedClient, SharedProgram, SurveyDraft, SurveyListItem, SurveyStatus } from '../types/survey'
 
 const friendlyError = '조사 정보를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 const db = () => { const client = getSupabase(); if (!client) throw new Error('Supabase 연결 설정을 확인해 주세요.'); return client }
@@ -87,10 +87,13 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
     stage = 'save-options'
     const questionIds = new Map(savedQuestions.map((question) => [question.sort_order, question.id]))
     const optionRows = draft.questions.flatMap((question, questionIndex) => {
-      if (question.response_type !== 'single_choice' && question.response_type !== 'multiple_choice') return []
+      if (question.response_type !== 'single_choice' && question.response_type !== 'multiple_choice' && question.response_type !== 'yes_no') return []
       const questionId = questionIds.get(questionIndex + 1)
       if (!questionId) throw new Error('Saved question was not found')
-      return question.options.map((option, optionIndex) => ({
+      const options = question.response_type === 'yes_no'
+        ? [{ label:'예', numeric_value:1 }, { label:'아니요', numeric_value:0 }]
+        : question.options
+      return options.map((option, optionIndex) => ({
         survey_question_id: questionId,
         label: option.label.trim(),
         numeric_value: option.numeric_value ?? null,
@@ -169,3 +172,61 @@ export async function changeSurveyStatus(id: string, organizationId: string, fro
   const { error } = await db().from('survey_projects').update(patch).eq('id',id).eq('organization_id',organizationId).eq('status',from); if(error) throw new Error('조사 상태를 변경하지 못했습니다.')
 }
 export async function deleteSurvey(id:string, organizationId:string) { const {error}=await db().from('survey_projects').delete().eq('id',id).eq('organization_id',organizationId); if(error) throw new Error('조사를 삭제하지 못했습니다.') }
+
+const runFailure = (stage: string, message: string) => { console.error(`[survey-run] failed at ${stage}`); throw new Error(message) }
+
+export async function listRunnableSurveys(organizationId: string): Promise<RunSurvey[]> {
+  const { data, error } = await db().from('survey_projects').select('id,title,survey_type,program_id,starts_at,survey_rounds(id,round_type,status,starts_at),survey_participants(count)').eq('organization_id', organizationId).eq('status', 'open').order('starts_at', { ascending: false })
+  if (error) return runFailure('load-surveys', '진행 중인 조사 목록을 불러오지 못했습니다.')
+  const rows = data ?? []; const programIds = rows.flatMap(r => r.program_id ? [r.program_id] : [])
+  const [{ data: programs }, { data: submissions, error: submissionError }] = await Promise.all([
+    programIds.length ? db().from('programs').select('id,name').eq('organization_id', organizationId).in('id', programIds) : Promise.resolve({ data: [] }),
+    db().from('survey_submissions').select('survey_round_id,status').eq('status', 'submitted'),
+  ])
+  if (submissionError) return runFailure('load-surveys', '완료 현황을 불러오지 못했습니다.')
+  const names = new Map((programs ?? []).map(p => [p.id, p.name])); const completed = new Map<string, number>()
+  for (const s of submissions ?? []) completed.set(s.survey_round_id, (completed.get(s.survey_round_id) ?? 0) + 1)
+  return rows.filter(r => r.survey_rounds.some(round => round.status === 'open')).map(r => {
+    const open = r.survey_rounds.filter(round => round.status === 'open')
+    return { id:r.id,title:r.title,survey_type:r.survey_type,program_name:r.program_id?names.get(r.program_id)??null:null,starts_at:r.starts_at,participant_count:r.survey_participants[0]?.count??0,completed_count:open.length===1?completed.get(open[0].id)??0:0,rounds:r.survey_rounds }
+  }) as RunSurvey[]
+}
+
+export async function loadRunParticipants(projectId: string, roundId: string, organizationId: string): Promise<RunParticipant[]> {
+  const [{ data: links, error }, { data: submissions, error: submissionError }] = await Promise.all([
+    db().from('survey_participants').select('client_id').eq('survey_project_id', projectId),
+    db().from('survey_submissions').select('id,client_id,status').eq('survey_round_id', roundId),
+  ])
+  if (error || submissionError) return runFailure('load-participants', '참여 이용인을 불러오지 못했습니다.')
+  const ids = (links ?? []).map(x => x.client_id); if (!ids.length) return []
+  const { data: clients, error: clientError } = await db().from('clients').select('id,name,photo_path,is_active').eq('organization_id', organizationId).in('id', ids).order('name')
+  if (clientError) return runFailure('load-participants', '참여 이용인을 불러오지 못했습니다.')
+  const states = new Map((submissions ?? []).map(s => [s.client_id, s]))
+  return (clients ?? []).map(c => ({ ...c, submission_id:states.get(c.id)?.id??null, submission_status:states.get(c.id)?.status??null })) as RunParticipant[]
+}
+
+export async function startRun(roundId: string, clientId: string) {
+  const { data, error } = await db().rpc('start_or_resume_survey_submission', { p_survey_round_id:roundId, p_client_id:clientId })
+  if (error || !data?.[0]) return runFailure('start-submission', '조사를 시작하지 못했습니다.')
+  return data[0] as { submission_id:string; submission_status:'draft'|'submitted'; round_type:'single'|'pre'|'post'; already_completed:boolean }
+}
+
+export async function loadRunQuestions(projectId: string): Promise<RunQuestion[]> {
+  const { data, error } = await db().from('survey_questions').select('id,domain,question_text,response_type,sort_order,is_required,survey_question_options(id,label,numeric_value,sort_order)').eq('survey_project_id', projectId).order('sort_order')
+  if (error) return runFailure('load-questions', '문항을 불러오지 못했습니다.')
+  return (data ?? []).map(q => ({ ...q, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order) })) as RunQuestion[]
+}
+
+export async function loadSavedAnswers(submissionId: string): Promise<SavedAnswer[]> {
+  const { data, error } = await db().from('survey_answers').select('survey_question_id,numeric_value,text_value,staff_note,survey_answer_options(survey_question_option_id)').eq('survey_submission_id', submissionId)
+  if (error) return runFailure('load-saved-answers', '저장된 응답을 불러오지 못했습니다.')
+  return (data ?? []).map(a => ({ question_id:a.survey_question_id,numeric_value:a.numeric_value,text_value:a.staff_note??a.text_value,option_ids:a.survey_answer_options.map(o=>o.survey_question_option_id) }))
+}
+
+export async function saveRunAnswer(submissionId:string, answer:SavedAnswer) {
+  const { error } = await db().rpc('save_survey_answer', { p_submission_id:submissionId,p_question_id:answer.question_id,p_numeric_value:answer.numeric_value,p_text_value:answer.text_value,p_option_ids:answer.option_ids })
+  if (error) return runFailure('save-answer', '응답을 저장하지 못했습니다. 연결을 확인하고 다시 시도해 주세요.')
+}
+export async function submitRun(submissionId:string) {
+  const { data,error }=await db().rpc('submit_survey_submission',{p_submission_id:submissionId}); if(error||!data?.[0])return runFailure('submit-submission','필수 응답을 확인하거나 잠시 후 다시 시도해 주세요.'); return data[0]
+}
