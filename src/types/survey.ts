@@ -10,3 +10,11 @@ export interface SurveyDraft { title: string; description: string; survey_type: 
 export interface SurveyTemplate { key: string; name: string; description: string; survey_type: SurveyType; title: string; questions: Omit<QuestionDraft, 'id'>[] }
 export interface SurveyListItem { id: string; title: string; description: string | null; survey_type: SurveyType; status: SurveyStatus; program_id: string | null; template_key: string | null; starts_at: string | null; created_at: string; participant_count: number; question_count: number; program_name: string | null }
 export interface LoadedSurvey { project: SurveyListItem; draft: SurveyDraft }
+
+export type SurveyRoundType = 'single' | 'pre' | 'post'
+export type SubmissionStatus = 'draft' | 'submitted'
+export interface RunRound { id: string; round_type: SurveyRoundType; status: 'pending' | 'open' | 'closed'; starts_at: string | null }
+export interface RunSurvey { id: string; title: string; survey_type: SurveyType; program_name: string | null; starts_at: string | null; participant_count: number; completed_count: number; rounds: RunRound[] }
+export interface RunParticipant extends SharedClient { submission_id: string | null; submission_status: SubmissionStatus | null }
+export interface RunQuestion { id: string; domain: string | null; question_text: string; response_type: ResponseType; sort_order: number; is_required: boolean; options: { id: string; label: string; numeric_value: number | null }[] }
+export interface SavedAnswer { question_id: string; numeric_value: number | null; text_value: string | null; option_ids: string[] }
