@@ -16,8 +16,8 @@ export function StatusBadge({ tone = 'neutral', children }: { tone?: 'success' |
   return <span className={`badge ${tone}`}>{children}</span>
 }
 
-export function ConfirmDialog({ open, title, description, confirmLabel = '확인', onConfirm, onClose }: {
-  open: boolean; title: string; description: string; confirmLabel?: string; onConfirm: () => void; onClose: () => void
+export function ConfirmDialog({ open, title, description, confirmLabel = '확인', onConfirm, onClose, children, busy=false }: {
+  open: boolean; title: string; description: string; confirmLabel?: string; onConfirm: () => void; onClose: () => void; children?:ReactNode; busy?:boolean
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -30,8 +30,8 @@ export function ConfirmDialog({ open, title, description, confirmLabel = '확인
   if (!open) return null
   return <div className="dialog-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
     <div role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-description" className="dialog">
-      <h2 id="dialog-title">{title}</h2><p id="dialog-description">{description}</p>
-      <div className="button-row"><button ref={cancelRef} className="button secondary" onClick={onClose}>취소</button><button className="button danger" onClick={onConfirm}>{confirmLabel}</button></div>
+      <h2 id="dialog-title">{title}</h2><p id="dialog-description">{description}</p>{children}
+      <div className="button-row"><button ref={cancelRef} className="button secondary" disabled={busy} onClick={onClose}>취소</button><button className="button danger" disabled={busy} onClick={onConfirm}>{busy?'처리 중…':confirmLabel}</button></div>
     </div>
   </div>
 }
