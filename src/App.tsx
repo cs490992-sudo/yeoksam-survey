@@ -13,8 +13,8 @@ export default function App() {
     <Route element={<ProtectedRoute />}><Route element={<AppShell />}>
       <Route index element={<Dashboard />} /><Route path="/admin/new" element={<SurveyEditor />} />
       <Route path="/surveys" element={<SurveyList />} /><Route path="/surveys/:surveyId/edit" element={<SurveyEditor />} /><Route path="/surveys/run" element={<SurveyRunPage />} /><Route path="/surveys/run/:surveyId/:roundId" element={<SurveyRunPage />} /><Route path="/surveys/run/:surveyId/:roundId/:clientId" element={<SurveyRunPage />} />
-      <Route path="/surveys/completion" element={<Completion />} /><Route path="/surveys/search" element={<Search />} />
-      <Route path="/reports" element={<Reports />} /><Route path="/reports/print" element={<PrintReport />} />
+      <Route path="/surveys/completion" element={<Completion />} /><Route path="/surveys/:surveyId/completion" element={<Completion />} /><Route path="/surveys/search" element={<Search />} />
+      <Route path="/reports" element={<Reports />} /><Route path="/reports/:surveyId" element={<Reports />} /><Route path="/reports/print" element={<PrintReport />} /><Route path="/reports/:surveyId/print" element={<PrintReport />} />
       <Route element={<AdminRoute />}><Route path="/admin/client-photos" element={<ClientPhotos />} /></Route>
       <Route path="*" element={<NotFound />} />
     </Route></Route>
