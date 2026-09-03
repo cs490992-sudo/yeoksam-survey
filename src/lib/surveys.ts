@@ -176,7 +176,7 @@ export async function changeSurveyStatus(id: string, organizationId: string, fro
   const now = new Date().toISOString(); const patch: Record<string,string|null> = { status:to }; if (to==='open') patch.starts_at=now; if(to==='closed') patch.ends_at=now
   const { error } = await db().from('survey_projects').update(patch).eq('id',id).eq('organization_id',organizationId).eq('status',from); if(error) throw new Error('조사 상태를 변경하지 못했습니다.')
 }
-export async function deleteSurvey(id:string, organizationId:string) { const {error}=await db().from('survey_projects').delete().eq('id',id).eq('organization_id',organizationId); if(error) throw new Error('조사를 삭제하지 못했습니다.') }
+export async function deleteSurvey(id:string) { const {error}=await db().rpc('delete_survey_project_with_data',{p_survey_project_id:id}); if(error){console.error('[survey-delete] transactional RPC failed',error);throw new Error('조사를 삭제하지 못했습니다.')} }
 
 const runFailure = (stage: string, message: string) => { console.error(`[survey-run] failed at ${stage}`); throw new Error(message) }
 
