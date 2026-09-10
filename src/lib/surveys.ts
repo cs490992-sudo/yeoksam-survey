@@ -3,7 +3,7 @@ import type { CompletionRound, LoadedSurvey, RunParticipant, RunQuestion, RunSur
 
 const friendlyError = '조사 정보를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 const db = () => { const client = getSupabase(); if (!client) throw new Error('Supabase 연결 설정을 확인해 주세요.'); return client }
-type SaveStage = 'create-project' | 'save-rounds' | 'save-questions' | 'save-options' | 'save-participants' | 'open-project' | 'open-round'
+type SaveStage = 'create-project' | 'save-rounds' | 'save-questions' | 'save-options' | 'save-participants' | 'open-project' | 'open-round' | 'schedule-project'
 
 function logSaveFailure(stage: SaveStage) {
   console.error(`[survey-save] failed at ${stage}`)
@@ -147,10 +147,17 @@ async function openSavedSurvey(projectId: string, organizationId: string, draft:
   }
 }
 
-export async function saveSurvey(draft: SurveyDraft, organizationId: string, start: boolean, existingId?: string) {
+export async function saveSurvey(draft: SurveyDraft, organizationId: string, action: 'draft'|'scheduled'|'start', existingId?: string) {
   const client = db()
   const { projectId, created } = await saveDraftStructure(draft, organizationId, existingId)
-  if (start) {
+  if (action === 'scheduled') {
+    const { error } = await client.rpc('schedule_survey_project', { p_survey_project_id:projectId })
+    if (error) {
+      logSaveFailure('schedule-project')
+      if (created) await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft')
+      throw new Error(error.message || friendlyError)
+    }
+  } else if (action === 'start') {
     try {
       await openSavedSurvey(projectId, organizationId, draft)
     } catch (error) {
@@ -175,6 +182,15 @@ export async function changeSurveyStatus(id: string, organizationId: string, fro
   const allowed = `${from}:${to}`; if (!['draft:open','open:closed','closed:archived','archived:closed'].includes(allowed)) throw new Error('허용되지 않은 상태 변경입니다.')
   const now = new Date().toISOString(); const patch: Record<string,string|null> = { status:to }; if (to==='open') patch.starts_at=now; if(to==='closed') patch.ends_at=now
   const { error } = await db().from('survey_projects').update(patch).eq('id',id).eq('organization_id',organizationId).eq('status',from); if(error) throw new Error('조사 상태를 변경하지 못했습니다.')
+}
+export async function startScheduledSurvey(id:string) {
+  const {data,error}=await db().rpc('start_scheduled_survey_project',{p_survey_project_id:id})
+  if(error||!data?.[0])return runFailure('start-scheduled',error?.message||'예정 조사를 시작하지 못했습니다.')
+  return data[0] as {result_project_id:string;result_round_id:string;started_at:string}
+}
+export async function returnScheduledSurveyToDraft(id:string) {
+  const {error}=await db().rpc('return_scheduled_survey_to_draft',{p_survey_project_id:id})
+  if(error) return runFailure('return-scheduled-to-draft',error.message||'예정 조사를 초안으로 되돌리지 못했습니다.')
 }
 export async function deleteSurvey(id:string) { const {error}=await db().rpc('delete_survey_project_with_data',{p_survey_project_id:id}); if(error){console.error('[survey-delete] transactional RPC failed',error);throw new Error('조사를 삭제하지 못했습니다.')} }
 
@@ -279,7 +295,7 @@ export async function openPostSurveyRound(projectId:string){
 
 export async function loadCompletionRounds(organizationId:string):Promise<CompletionRound[]>{
   const projects=await listSurveys(organizationId)
-  const activeProjects=projects.filter(project=>project.status!=='draft')
+  const activeProjects=projects.filter(project=>project.status==='open'||project.status==='closed'||project.status==='archived')
   const result:CompletionRound[]=[]
   for(const project of activeProjects){
     const [{data:links,error:linkError},{data:submissions,error:submissionError}]=await Promise.all([
