@@ -1,5 +1,5 @@
 export type SurveyType = 'single' | 'pre_post'
-export type SurveyStatus = 'draft' | 'open' | 'closed' | 'archived'
+export type SurveyStatus = 'draft' | 'scheduled' | 'open' | 'closed' | 'archived'
 export type ResponseType = 'face_3' | 'face_5' | 'scale_3' | 'scale_5' | 'yes_no' | 'single_choice' | 'multiple_choice' | 'staff_note'
 
 export interface SharedClient { id: string; name: string; photo_path: string | null; is_active: boolean }
