@@ -3,7 +3,16 @@ import type { CompletionRound, LoadedSurvey, RunParticipant, RunQuestion, RunSur
 
 const friendlyError = '조사 정보를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 const db = () => { const client = getSupabase(); if (!client) throw new Error('Supabase 연결 설정을 확인해 주세요.'); return client }
-type SaveStage = 'create-project' | 'save-rounds' | 'save-questions' | 'save-options' | 'save-participants' | 'open-project' | 'open-round' | 'schedule-project'
+type SaveStage = 'create-project' | 'upload-images' | 'save-rounds' | 'save-questions' | 'save-options' | 'save-participants' | 'open-project' | 'open-round' | 'schedule-project'
+const questionImageBucket = 'survey-question-images'
+
+async function signedQuestionImageUrls(paths: (string | null)[]) {
+  const unique = [...new Set(paths.filter((path): path is string => Boolean(path)))]
+  if (!unique.length) return new Map<string,string>()
+  const { data, error } = await db().storage.from(questionImageBucket).createSignedUrls(unique, 60 * 60)
+  if (error) throw new Error('문항 사진을 불러오지 못했습니다.')
+  return new Map((data ?? []).filter(item => item.signedUrl).map(item => [item.path, item.signedUrl]))
+}
 
 function logSaveFailure(stage: SaveStage) {
   console.error(`[survey-save] failed at ${stage}`)
@@ -38,6 +47,8 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
   let projectId = existingId
   let created = false
   let stage: SaveStage = 'create-project'
+  const uploadedPaths: string[] = []
+  let previousPaths: string[] = []
 
   try {
     const project = {
@@ -52,13 +63,11 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
     }
 
     if (existingId) {
+      const { data: previousQuestions, error: previousError } = await client.from('survey_questions').select('image_path').eq('survey_project_id', existingId)
+      if (previousError) throw previousError
+      previousPaths = (previousQuestions ?? []).flatMap(question => question.image_path ? [question.image_path] : [])
       const { data, error } = await client.from('survey_projects').update(project).eq('id', existingId).eq('organization_id', organizationId).eq('status', 'draft').select('id').single()
       if (error || !data) throw error ?? new Error('Draft project was not updated')
-
-      for (const table of ['survey_participants', 'survey_questions', 'survey_rounds'] as const) {
-        const { error: deleteError } = await client.from(table).delete().eq('survey_project_id', existingId)
-        if (deleteError) throw deleteError
-      }
     } else {
       const { data, error } = await client.from('survey_projects').insert(project).select('id').single()
       if (error || !data) throw error ?? new Error('Draft project was not created')
@@ -66,6 +75,24 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
       created = true
     }
     if (!projectId) throw new Error('Draft project id was not available')
+
+    stage = 'upload-images'
+    for (const question of draft.questions) {
+      if (!question.image_file) continue
+      const extension = question.image_file.type.split('/')[1] === 'jpeg' ? 'jpg' : question.image_file.type.split('/')[1]
+      const path = `${organizationId}/${projectId}/${question.id}/${crypto.randomUUID()}.${extension}`
+      const { error: uploadError } = await client.storage.from(questionImageBucket).upload(path, question.image_file, { contentType:question.image_file.type, upsert:false })
+      if (uploadError) throw uploadError
+      uploadedPaths.push(path)
+      question.image_path = path
+    }
+
+    if (existingId) {
+      for (const table of ['survey_participants', 'survey_questions', 'survey_rounds'] as const) {
+        const { error: deleteError } = await client.from(table).delete().eq('survey_project_id', existingId)
+        if (deleteError) throw deleteError
+      }
+    }
 
     stage = 'save-rounds'
     const rounds = draft.survey_type === 'single'
@@ -85,6 +112,7 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
       response_type: question.response_type,
       sort_order: index + 1,
       is_required: question.is_required,
+      image_path: question.image_path,
     }))
     const { data: savedQuestions, error: questionsError } = await client.from('survey_questions').insert(questionRows).select('id,sort_order')
     if (questionsError || !savedQuestions || savedQuestions.length !== questionRows.length) throw questionsError ?? new Error('Questions were not saved')
@@ -117,9 +145,19 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
       if (participantsError) throw participantsError
     }
 
+    const retainedPaths = new Set(draft.questions.flatMap(question => question.image_path ? [question.image_path] : []))
+    const obsoletePaths = previousPaths.filter(path => !retainedPaths.has(path))
+    if (obsoletePaths.length) {
+      const { error: cleanupError } = await client.storage.from(questionImageBucket).remove(obsoletePaths)
+      if (cleanupError) console.error('[survey-save] failed to clean up replaced question images')
+    }
     return { projectId, created }
   } catch {
     logSaveFailure(stage)
+    if (uploadedPaths.length) {
+      const { error: cleanupError } = await client.storage.from(questionImageBucket).remove(uploadedPaths)
+      if (cleanupError) console.error('[survey-save] failed to clean up newly uploaded question images')
+    }
     if (created && projectId) {
       const { error: cleanupError } = await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft')
       if (cleanupError) console.error('[survey-save] failed to clean up new draft project')
@@ -172,9 +210,10 @@ export async function saveSurvey(draft: SurveyDraft, organizationId: string, act
 }
 
 export async function loadSurvey(id: string, organizationId: string): Promise<LoadedSurvey> {
-  const { data, error } = await db().from('survey_projects').select('id,title,description,survey_type,status,program_id,template_key,starts_at,created_at,survey_participants(client_id),survey_questions(id,domain,question_text,response_type,is_required,sort_order,survey_question_options(id,label,numeric_value,sort_order))').eq('id', id).eq('organization_id', organizationId).single()
+  const { data, error } = await db().from('survey_projects').select('id,title,description,survey_type,status,program_id,template_key,starts_at,created_at,survey_participants(client_id),survey_questions(id,domain,question_text,response_type,is_required,image_path,sort_order,survey_question_options(id,label,numeric_value,sort_order))').eq('id', id).eq('organization_id', organizationId).single()
   if (error || !data) throw new Error('조사를 찾을 수 없거나 접근 권한이 없습니다.')
-  const questions = [...data.survey_questions].sort((a,b) => a.sort_order-b.sort_order).map((q) => ({ id:q.id, domain:q.domain ?? '', question_text:q.question_text, response_type:q.response_type, is_required:q.is_required, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order).map(o=>({id:o.id,label:o.label,numeric_value:o.numeric_value})) }))
+  const imageUrls = await signedQuestionImageUrls(data.survey_questions.map(question => question.image_path))
+  const questions = [...data.survey_questions].sort((a,b) => a.sort_order-b.sort_order).map((q) => ({ id:q.id, domain:q.domain ?? '', question_text:q.question_text, response_type:q.response_type, is_required:q.is_required, image_path:q.image_path, image_preview_url:q.image_path ? imageUrls.get(q.image_path) ?? null : null, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order).map(o=>({id:o.id,label:o.label,numeric_value:o.numeric_value})) }))
   return { project: { ...data, ends_at:null,participant_count:data.survey_participants.length, question_count:questions.length, program_name:null,rounds:[] } as SurveyListItem, draft: { title:data.title, description:data.description ?? '', survey_type:data.survey_type, program_id:data.program_id ?? '', template_key:data.template_key, participant_ids:data.survey_participants.map(p=>p.client_id), questions } }
 }
 
@@ -233,9 +272,10 @@ export async function startRun(roundId: string, clientId: string) {
 }
 
 export async function loadRunQuestions(projectId: string): Promise<RunQuestion[]> {
-  const { data, error } = await db().from('survey_questions').select('id,domain,question_text,response_type,sort_order,is_required,survey_question_options(id,label,numeric_value,sort_order)').eq('survey_project_id', projectId).order('sort_order')
+  const { data, error } = await db().from('survey_questions').select('id,domain,question_text,response_type,sort_order,is_required,image_path,survey_question_options(id,label,numeric_value,sort_order)').eq('survey_project_id', projectId).order('sort_order')
   if (error) return runFailure('load-questions', '문항을 불러오지 못했습니다.')
-  return (data ?? []).map(q => ({ ...q, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order) })) as RunQuestion[]
+  const imageUrls = await signedQuestionImageUrls((data ?? []).map(question => question.image_path))
+  return (data ?? []).map(q => ({ ...q, image_url:q.image_path ? imageUrls.get(q.image_path) ?? null : null, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order) })) as RunQuestion[]
 }
 
 export async function loadSavedAnswers(submissionId: string): Promise<SavedAnswer[]> {
