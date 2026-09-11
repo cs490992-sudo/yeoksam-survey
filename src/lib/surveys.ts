@@ -49,6 +49,7 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
   let stage: SaveStage = 'create-project'
   const uploadedPaths: string[] = []
   let previousPaths: string[] = []
+  let questionsCommitted = false
 
   try {
     const project = {
@@ -115,7 +116,10 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
       image_path: question.image_path,
     }))
     const { data: savedQuestions, error: questionsError } = await client.from('survey_questions').insert(questionRows).select('id,sort_order')
+    questionsCommitted = !questionsError
     if (questionsError || !savedQuestions || savedQuestions.length !== questionRows.length) throw questionsError ?? new Error('Questions were not saved')
+    // A PostgREST bulk insert is atomic. From here on, image_path may be
+    // referenced by the database, so failure cleanup must prefer an orphan.
 
     stage = 'save-options'
     const questionIds = new Map(savedQuestions.map((question) => [question.sort_order, question.id]))
@@ -154,7 +158,7 @@ async function saveDraftStructure(draft: SurveyDraft, organizationId: string, ex
     return { projectId, created }
   } catch {
     logSaveFailure(stage)
-    if (uploadedPaths.length) {
+    if (!questionsCommitted && uploadedPaths.length) {
       const { error: cleanupError } = await client.storage.from(questionImageBucket).remove(uploadedPaths)
       if (cleanupError) console.error('[survey-save] failed to clean up newly uploaded question images')
     }
@@ -231,7 +235,30 @@ export async function returnScheduledSurveyToDraft(id:string) {
   const {error}=await db().rpc('return_scheduled_survey_to_draft',{p_survey_project_id:id})
   if(error) return runFailure('return-scheduled-to-draft',error.message||'예정 조사를 초안으로 되돌리지 못했습니다.')
 }
-export async function deleteSurvey(id:string) { const {error}=await db().rpc('delete_survey_project_with_data',{p_survey_project_id:id}); if(error){console.error('[survey-delete] transactional RPC failed',error);throw new Error('조사를 삭제하지 못했습니다.')} }
+export async function deleteSurvey(id:string) {
+  const client=db()
+  const {data:project,error:lookupError}=await client.from('survey_projects').select('organization_id,survey_questions(image_path)').eq('id',id).single()
+  if(lookupError)console.error('[survey-delete] failed to collect question images before project deletion')
+  const organizationPrefix=project?`${project.organization_id}/`:''
+  const imagePaths=new Set((project?.survey_questions??[]).flatMap(question=>question.image_path&&question.image_path.startsWith(organizationPrefix)?[question.image_path]:[]))
+  // Include orphan objects left by a previous partial save. Listing happens
+  // before the project row is deleted because SELECT policy validates the project.
+  if(project){
+    const projectPrefix=`${project.organization_id}/${id}`
+    const {data:questionFolders,error:listError}=await client.storage.from(questionImageBucket).list(projectPrefix,{limit:1000})
+    if(listError)console.error('[survey-delete] failed to list question image folders before project deletion')
+    else for(const folder of questionFolders??[]){
+      const {data:files,error:fileError}=await client.storage.from(questionImageBucket).list(`${projectPrefix}/${folder.name}`,{limit:1000})
+      if(fileError){console.error('[survey-delete] failed to list a question image folder before project deletion');continue}
+      for(const file of files??[])if(file.id)imagePaths.add(`${projectPrefix}/${folder.name}/${file.name}`)
+    }
+  }
+  const {error}=await client.rpc('delete_survey_project_with_data',{p_survey_project_id:id})
+  if(error){console.error('[survey-delete] transactional RPC failed',error);throw new Error('조사를 삭제하지 못했습니다.')}
+  // The database deletion is authoritative. Storage cleanup is deliberately
+  // best-effort and restricted to paths under the deleted project's organization.
+  if(imagePaths.size){const {error:cleanupError}=await client.storage.from(questionImageBucket).remove([...imagePaths]);if(cleanupError)console.error('[survey-delete] failed to clean up question images after project deletion')}
+}
 
 const runFailure = (stage: string, message: string) => { console.error(`[survey-run] failed at ${stage}`); throw new Error(message) }
 

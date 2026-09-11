@@ -81,12 +81,23 @@ create policy survey_question_images_delete
 on storage.objects for delete to authenticated
 using (
   bucket_id = 'survey-question-images'
-  and exists (
-    select 1 from public.profiles p
-    join public.survey_projects sp on sp.organization_id = p.organization_id
-    where p.id = auth.uid() and p.is_active = true and p.role in ('admin', 'staff')
-      and sp.status = 'draft'
-      and (storage.foldername(name))[1] = p.organization_id::text
-      and (storage.foldername(name))[2] = sp.id::text
+  and (
+    -- Active staff/admin may clean images while editing their own draft.
+    exists (
+      select 1 from public.profiles p
+      join public.survey_projects sp on sp.organization_id = p.organization_id
+      where p.id = auth.uid() and p.is_active = true and p.role in ('admin', 'staff')
+        and sp.status = 'draft'
+        and (storage.foldername(name))[1] = p.organization_id::text
+        and (storage.foldername(name))[2] = sp.id::text
+    )
+    or
+    -- Project deletion is admin-only in the existing RPC. Once its DB row has
+    -- gone, an active admin can remove only objects inside their own org folder.
+    exists (
+      select 1 from public.profiles p
+      where p.id = auth.uid() and p.is_active = true and p.role = 'admin'
+        and (storage.foldername(name))[1] = p.organization_id::text
+    )
   )
 );
