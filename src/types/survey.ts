@@ -23,3 +23,15 @@ export interface SubmissionDetails { id:string; status:SubmissionStatus; submitt
 export interface SubmissionRevision { id:string; edited_at:string; edited_by:string; edited_by_name:string|null; edit_reason:string|null; revision_number:number; previous_answers:SavedAnswer[] }
 export interface CompletionParticipant extends SharedClient { submission_id:string|null; submission_status:SubmissionStatus|null; submitted_at:string|null; last_edited_at:string|null }
 export interface CompletionRound { project_id:string; project_title:string; program_id:string|null; program_name:string|null; survey_type:SurveyType; project_status:SurveyStatus; round:SurveyRoundSummary; participant_count:number; participants:CompletionParticipant[] }
+
+export interface RecordAnswer { id:string; survey_submission_id:string; survey_question_id:string; numeric_value:number|null; text_value:string|null; staff_note:string|null; option_ids:string[] }
+export interface RecordSubmission { id:string; survey_round_id:string; client_id:string; status:SubmissionStatus; submitted_at:string|null; last_edited_at:string|null }
+export interface RecordQuestion extends RunQuestion {}
+export interface SurveyRecordData {
+  project:SurveyListItem
+  rounds:SurveyRoundSummary[]
+  participants:SharedClient[]
+  submissions:RecordSubmission[]
+  questions:RecordQuestion[]
+  answers:RecordAnswer[]
+}
