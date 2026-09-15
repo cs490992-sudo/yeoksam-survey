@@ -26,6 +26,7 @@ declare
   v_question_id uuid;
   v_question_order bigint;
   v_option_order bigint;
+  v_valid_option_count bigint;
 begin
   if v_user_id is null then raise exception '로그인이 필요합니다.'; end if;
   select p.organization_id into v_organization_id
@@ -71,6 +72,17 @@ begin
   for v_question, v_question_order in
     select value, ordinality from jsonb_array_elements(p_questions) with ordinality
   loop
+    if v_question->>'response_type' in ('single_choice', 'multiple_choice') then
+      select count(*) into v_valid_option_count
+      from jsonb_array_elements(
+        case when jsonb_typeof(v_question->'options') = 'array'
+          then v_question->'options' else '[]'::jsonb end
+      ) as choice(option)
+      where nullif(btrim(choice.option->>'label'), '') is not null;
+      if v_valid_option_count < 2 then
+        raise exception '선택형 질문에는 내용이 있는 선택지가 두 개 이상 필요합니다.';
+      end if;
+    end if;
     if nullif(v_question->>'image_path', '') is not null
        and (v_question->>'image_path') not like v_organization_id::text || '/' || v_project_id::text || '/%' then
       raise exception '문항 사진 경로가 조사 기관 또는 프로젝트와 일치하지 않습니다.';
@@ -148,6 +160,14 @@ begin
   if v_project.id is null then raise exception '시작할 수 있는 초안 조사를 찾지 못했습니다.'; end if;
   if not exists (select 1 from public.survey_questions where survey_project_id = v_project.id) then raise exception '질문을 한 개 이상 추가해 주세요.'; end if;
   if not exists (select 1 from public.survey_participants where survey_project_id = v_project.id) then raise exception '참여 이용인을 한 명 이상 선택해 주세요.'; end if;
+  if exists (
+    select 1
+    from public.survey_questions q
+    where q.survey_project_id = v_project.id
+      and q.response_type in ('single_choice', 'multiple_choice')
+      and (select count(*) from public.survey_question_options o where o.survey_question_id = q.id) < 2
+  ) then raise exception '선택형 질문에는 선택지가 두 개 이상 필요합니다.';
+  end if;
 
   update public.survey_projects set status = 'open', starts_at = v_started_at where id = v_project.id;
   update public.survey_rounds set status = 'open', starts_at = v_started_at, ends_at = null
