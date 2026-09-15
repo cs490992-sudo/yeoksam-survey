@@ -1,12 +1,21 @@
 import { getSupabase } from './supabase'
 import type { CompletionRound, LoadedSurvey, RunParticipant, RunQuestion, RunSurvey, SavedAnswer, SharedClient, SharedProgram, SubmissionDetails, SubmissionRevision, SurveyDraft, SurveyListItem, SurveyStatus } from '../types/survey'
 
-const friendlyError = '조사 정보를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.'
 const db = () => { const client = getSupabase(); if (!client) throw new Error('Supabase 연결 설정을 확인해 주세요.'); return client }
-type SaveStage = 'create-project' | 'save-rounds' | 'save-questions' | 'save-options' | 'save-participants' | 'open-project' | 'open-round' | 'schedule-project'
+type SaveStage = 'create-project' | 'upload-images' | 'save-structure' | 'start-project' | 'schedule-project'
+const questionImageBucket = 'survey-question-images'
 
-function logSaveFailure(stage: SaveStage) {
-  console.error(`[survey-save] failed at ${stage}`)
+async function signedQuestionImageUrls(paths: (string | null)[]) {
+  const unique = [...new Set(paths.filter((path): path is string => Boolean(path)))]
+  if (!unique.length) return new Map<string,string>()
+  const { data, error } = await db().storage.from(questionImageBucket).createSignedUrls(unique, 60 * 60)
+  if (error) throw new Error('문항 사진을 불러오지 못했습니다.')
+  return new Map((data ?? []).filter(item => item.signedUrl).map(item => [item.path, item.signedUrl]))
+}
+
+function logSaveFailure(stage: SaveStage, error: unknown) {
+  const failure=error as {code?:string;message?:string}|null
+  console.error('[survey-save] failed', { stage, code:failure?.code??'unknown', message:failure?.message??'Unknown error' })
 }
 
 export async function loadSharedData(organizationId: string) {
@@ -36,145 +45,112 @@ export async function listSurveys(organizationId: string): Promise<SurveyListIte
 async function saveDraftStructure(draft: SurveyDraft, organizationId: string, existingId?: string) {
   const client = db()
   let projectId = existingId
-  let created = false
+  let createdShell = false
   let stage: SaveStage = 'create-project'
+  const uploadedPaths: string[] = []
+  let previousPaths: string[] = []
 
   try {
-    const project = {
-      organization_id: organizationId,
-      program_id: draft.program_id || null,
-      title: draft.title.trim(),
-      description: draft.description.trim() || null,
-      survey_type: draft.survey_type,
-      template_key: draft.template_key,
-      status: 'draft' as const,
-      starts_at: null,
-    }
-
     if (existingId) {
-      const { data, error } = await client.from('survey_projects').update(project).eq('id', existingId).eq('organization_id', organizationId).eq('status', 'draft').select('id').single()
-      if (error || !data) throw error ?? new Error('Draft project was not updated')
-
-      for (const table of ['survey_participants', 'survey_questions', 'survey_rounds'] as const) {
-        const { error: deleteError } = await client.from(table).delete().eq('survey_project_id', existingId)
-        if (deleteError) throw deleteError
-      }
-    } else {
-      const { data, error } = await client.from('survey_projects').insert(project).select('id').single()
-      if (error || !data) throw error ?? new Error('Draft project was not created')
-      projectId = data.id
-      created = true
+      const { data: previousQuestions, error } = await client.from('survey_questions').select('image_path').eq('survey_project_id', existingId)
+      if (error) throw error
+      previousPaths = (previousQuestions ?? []).flatMap(question => question.image_path ? [question.image_path] : [])
     }
-    if (!projectId) throw new Error('Draft project id was not available')
 
-    stage = 'save-rounds'
-    const rounds = draft.survey_type === 'single'
-      ? [{ survey_project_id: projectId, round_type: 'single', status: 'pending' }]
-      : [
-          { survey_project_id: projectId, round_type: 'pre', status: 'pending' },
-          { survey_project_id: projectId, round_type: 'post', status: 'pending' },
-        ]
-    const { error: roundsError } = await client.from('survey_rounds').insert(rounds)
-    if (roundsError) throw roundsError
+    const hasNewImages = draft.questions.some(question => Boolean(question.image_file))
+    // Storage INSERT policy requires a real draft project. Only image-bearing new
+    // surveys need this minimal shell; the RPC creates image-free surveys atomically.
+    if (!projectId && hasNewImages) {
+      const { data, error } = await client.from('survey_projects').insert({
+        organization_id:organizationId, program_id:draft.program_id||null, title:draft.title.trim(),
+        description:draft.description.trim()||null, survey_type:draft.survey_type,
+        template_key:draft.template_key, status:'draft', starts_at:null,
+      }).select('id').single()
+      if (error || !data) throw error ?? new Error('Draft project shell was not created')
+      projectId=data.id
+      createdShell=true
+    }
 
-    stage = 'save-questions'
-    const questionRows = draft.questions.map((question, index) => ({
-      survey_project_id: projectId,
-      domain: question.domain.trim() || null,
-      question_text: question.question_text.trim(),
-      response_type: question.response_type,
-      sort_order: index + 1,
-      is_required: question.is_required,
+    stage = 'upload-images'
+    for (const question of draft.questions) {
+      if (!question.image_file) continue
+      if (!projectId) throw new Error('Draft project id was not available for image upload')
+      const extension = question.image_file.type.split('/')[1] === 'jpeg' ? 'jpg' : question.image_file.type.split('/')[1]
+      const path = `${organizationId}/${projectId}/${question.id}/${crypto.randomUUID()}.${extension}`
+      const { error } = await client.storage.from(questionImageBucket).upload(path, question.image_file, { contentType:question.image_file.type, upsert:false })
+      if (error) throw error
+      uploadedPaths.push(path)
+      question.image_path = path
+    }
+
+    const questions=draft.questions.map(question=>({
+      domain:question.domain.trim()||null,
+      question_text:question.question_text.trim(), response_type:question.response_type,
+      is_required:question.is_required, image_path:question.image_path,
+      options:(question.response_type==='yes_no'
+        ?[{label:'예',numeric_value:1},{label:'아니요',numeric_value:0}]
+        :question.response_type==='single_choice'||question.response_type==='multiple_choice'
+          ?question.options.map(option=>({label:option.label.trim(),numeric_value:option.numeric_value??null}))
+          :[]),
     }))
-    const { data: savedQuestions, error: questionsError } = await client.from('survey_questions').insert(questionRows).select('id,sort_order')
-    if (questionsError || !savedQuestions || savedQuestions.length !== questionRows.length) throw questionsError ?? new Error('Questions were not saved')
-
-    stage = 'save-options'
-    const questionIds = new Map(savedQuestions.map((question) => [question.sort_order, question.id]))
-    const optionRows = draft.questions.flatMap((question, questionIndex) => {
-      if (question.response_type !== 'single_choice' && question.response_type !== 'multiple_choice' && question.response_type !== 'yes_no') return []
-      const questionId = questionIds.get(questionIndex + 1)
-      if (!questionId) throw new Error('Saved question was not found')
-      const options = question.response_type === 'yes_no'
-        ? [{ label:'예', numeric_value:1 }, { label:'아니요', numeric_value:0 }]
-        : question.options
-      return options.map((option, optionIndex) => ({
-        survey_question_id: questionId,
-        label: option.label.trim(),
-        numeric_value: option.numeric_value ?? null,
-        sort_order: optionIndex + 1,
-      }))
+    stage = 'save-structure'
+    const {data,error}=await client.rpc('save_survey_draft_structure',{
+      p_survey_project_id:projectId??null, p_organization_id:organizationId,
+      p_title:draft.title.trim(), p_description:draft.description.trim(), p_survey_type:draft.survey_type,
+      p_program_id:draft.program_id||null, p_template_key:draft.template_key,
+      p_questions:questions, p_participant_ids:draft.participant_ids,
     })
-    if (optionRows.length) {
-      const { error: optionsError } = await client.from('survey_question_options').insert(optionRows)
-      if (optionsError) throw optionsError
-    }
+    if(error||!data)throw error??new Error('Draft structure RPC returned no project id')
+    projectId=data as string
 
-    stage = 'save-participants'
-    const participants = draft.participant_ids.map((client_id) => ({ survey_project_id: projectId, client_id }))
-    if (participants.length) {
-      const { error: participantsError } = await client.from('survey_participants').insert(participants)
-      if (participantsError) throw participantsError
+    const retainedPaths = new Set(draft.questions.flatMap(question => question.image_path ? [question.image_path] : []))
+    const obsoletePaths = previousPaths.filter(path => !retainedPaths.has(path))
+    if (obsoletePaths.length) {
+      const { error: cleanupError } = await client.storage.from(questionImageBucket).remove(obsoletePaths)
+      if (cleanupError) console.error('[survey-save] failed to clean up replaced question images')
     }
-
-    return { projectId, created }
-  } catch {
-    logSaveFailure(stage)
-    if (created && projectId) {
-      const { error: cleanupError } = await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft')
-      if (cleanupError) console.error('[survey-save] failed to clean up new draft project')
+    return projectId
+  } catch (error) {
+    logSaveFailure(stage,error)
+    // The transactional RPC either committed every new reference or rolled all
+    // of them back. On failure only uploads from this attempt are safe to remove.
+    if (uploadedPaths.length) {
+      const { error: cleanupError } = await client.storage.from(questionImageBucket).remove(uploadedPaths)
+      if (cleanupError) console.error('[survey-save] failed to clean up newly uploaded question images')
     }
-    throw new Error(friendlyError)
+    if (createdShell && projectId) {
+      const { error: cleanupError } = await client.rpc('discard_empty_survey_draft',{p_survey_project_id:projectId})
+      if (cleanupError) console.error('[survey-save] failed to clean up new draft project shell')
+    }
+    throw new Error(stage==='upload-images'?'문항 사진을 업로드하지 못했습니다.':'조사 내용을 저장하지 못했습니다.')
   }
 }
 
-async function openSavedSurvey(projectId: string, organizationId: string, draft: SurveyDraft) {
-  const client = db()
-  const now = new Date().toISOString()
-  let stage: SaveStage = 'open-project'
-
-  try {
-    const { data, error } = await client.from('survey_projects').update({ status: 'open', starts_at: now }).eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft').select('id').single()
-    if (error || !data) throw error ?? new Error('Project was not opened')
-
-    stage = 'open-round'
-    const roundType = draft.survey_type === 'single' ? 'single' : 'pre'
-    const { data: round, error: roundError } = await client.from('survey_rounds').update({ status: 'open', starts_at: now }).eq('survey_project_id', projectId).eq('round_type', roundType).eq('status', 'pending').select('id').single()
-    if (roundError || !round) throw roundError ?? new Error('Round was not opened')
-  } catch {
-    logSaveFailure(stage)
-    throw new Error(friendlyError)
-  }
+async function openSavedSurvey(projectId: string) {
+  const {data,error}=await db().rpc('start_draft_survey_project',{p_survey_project_id:projectId})
+  if(error||!data?.[0]){logSaveFailure('start-project',error);throw new Error('조사는 저장되었지만 시작하지 못했습니다.')}
 }
 
 export async function saveSurvey(draft: SurveyDraft, organizationId: string, action: 'draft'|'scheduled'|'start', existingId?: string) {
   const client = db()
-  const { projectId, created } = await saveDraftStructure(draft, organizationId, existingId)
+  const projectId = await saveDraftStructure(draft, organizationId, existingId)
   if (action === 'scheduled') {
     const { error } = await client.rpc('schedule_survey_project', { p_survey_project_id:projectId })
     if (error) {
-      logSaveFailure('schedule-project')
-      if (created) await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft')
-      throw new Error(error.message || friendlyError)
+      logSaveFailure('schedule-project',error)
+      throw new Error('조사는 저장되었지만 예정으로 등록하지 못했습니다.')
     }
   } else if (action === 'start') {
-    try {
-      await openSavedSurvey(projectId, organizationId, draft)
-    } catch (error) {
-      if (created) {
-        const { error: cleanupError } = await client.from('survey_projects').delete().eq('id', projectId).eq('organization_id', organizationId).eq('status', 'draft')
-        if (cleanupError) console.error('[survey-save] failed to clean up new draft project')
-      }
-      throw error
-    }
+    await openSavedSurvey(projectId)
   }
   return projectId
 }
 
 export async function loadSurvey(id: string, organizationId: string): Promise<LoadedSurvey> {
-  const { data, error } = await db().from('survey_projects').select('id,title,description,survey_type,status,program_id,template_key,starts_at,created_at,survey_participants(client_id),survey_questions(id,domain,question_text,response_type,is_required,sort_order,survey_question_options(id,label,numeric_value,sort_order))').eq('id', id).eq('organization_id', organizationId).single()
+  const { data, error } = await db().from('survey_projects').select('id,title,description,survey_type,status,program_id,template_key,starts_at,created_at,survey_participants(client_id),survey_questions(id,domain,question_text,response_type,is_required,image_path,sort_order,survey_question_options(id,label,numeric_value,sort_order))').eq('id', id).eq('organization_id', organizationId).single()
   if (error || !data) throw new Error('조사를 찾을 수 없거나 접근 권한이 없습니다.')
-  const questions = [...data.survey_questions].sort((a,b) => a.sort_order-b.sort_order).map((q) => ({ id:q.id, domain:q.domain ?? '', question_text:q.question_text, response_type:q.response_type, is_required:q.is_required, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order).map(o=>({id:o.id,label:o.label,numeric_value:o.numeric_value})) }))
+  const imageUrls = await signedQuestionImageUrls(data.survey_questions.map(question => question.image_path))
+  const questions = [...data.survey_questions].sort((a,b) => a.sort_order-b.sort_order).map((q) => ({ id:q.id, domain:q.domain ?? '', question_text:q.question_text, response_type:q.response_type, is_required:q.is_required, image_path:q.image_path, image_preview_url:q.image_path ? imageUrls.get(q.image_path) ?? null : null, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order).map(o=>({id:o.id,label:o.label,numeric_value:o.numeric_value})) }))
   return { project: { ...data, ends_at:null,participant_count:data.survey_participants.length, question_count:questions.length, program_name:null,rounds:[] } as SurveyListItem, draft: { title:data.title, description:data.description ?? '', survey_type:data.survey_type, program_id:data.program_id ?? '', template_key:data.template_key, participant_ids:data.survey_participants.map(p=>p.client_id), questions } }
 }
 
@@ -192,7 +168,30 @@ export async function returnScheduledSurveyToDraft(id:string) {
   const {error}=await db().rpc('return_scheduled_survey_to_draft',{p_survey_project_id:id})
   if(error) return runFailure('return-scheduled-to-draft',error.message||'예정 조사를 초안으로 되돌리지 못했습니다.')
 }
-export async function deleteSurvey(id:string) { const {error}=await db().rpc('delete_survey_project_with_data',{p_survey_project_id:id}); if(error){console.error('[survey-delete] transactional RPC failed',error);throw new Error('조사를 삭제하지 못했습니다.')} }
+export async function deleteSurvey(id:string) {
+  const client=db()
+  const {data:project,error:lookupError}=await client.from('survey_projects').select('organization_id,survey_questions(image_path)').eq('id',id).single()
+  if(lookupError)console.error('[survey-delete] failed to collect question images before project deletion')
+  const organizationPrefix=project?`${project.organization_id}/`:''
+  const imagePaths=new Set((project?.survey_questions??[]).flatMap(question=>question.image_path&&question.image_path.startsWith(organizationPrefix)?[question.image_path]:[]))
+  // Include orphan objects left by a previous partial save. Listing happens
+  // before the project row is deleted because SELECT policy validates the project.
+  if(project){
+    const projectPrefix=`${project.organization_id}/${id}`
+    const {data:questionFolders,error:listError}=await client.storage.from(questionImageBucket).list(projectPrefix,{limit:1000})
+    if(listError)console.error('[survey-delete] failed to list question image folders before project deletion')
+    else for(const folder of questionFolders??[]){
+      const {data:files,error:fileError}=await client.storage.from(questionImageBucket).list(`${projectPrefix}/${folder.name}`,{limit:1000})
+      if(fileError){console.error('[survey-delete] failed to list a question image folder before project deletion');continue}
+      for(const file of files??[])if(file.id)imagePaths.add(`${projectPrefix}/${folder.name}/${file.name}`)
+    }
+  }
+  const {error}=await client.rpc('delete_survey_project_with_data',{p_survey_project_id:id})
+  if(error){console.error('[survey-delete] transactional RPC failed',error);throw new Error('조사를 삭제하지 못했습니다.')}
+  // The database deletion is authoritative. Storage cleanup is deliberately
+  // best-effort and restricted to paths under the deleted project's organization.
+  if(imagePaths.size){const {error:cleanupError}=await client.storage.from(questionImageBucket).remove([...imagePaths]);if(cleanupError)console.error('[survey-delete] failed to clean up question images after project deletion')}
+}
 
 const runFailure = (stage: string, message: string) => { console.error(`[survey-run] failed at ${stage}`); throw new Error(message) }
 
@@ -233,9 +232,10 @@ export async function startRun(roundId: string, clientId: string) {
 }
 
 export async function loadRunQuestions(projectId: string): Promise<RunQuestion[]> {
-  const { data, error } = await db().from('survey_questions').select('id,domain,question_text,response_type,sort_order,is_required,survey_question_options(id,label,numeric_value,sort_order)').eq('survey_project_id', projectId).order('sort_order')
+  const { data, error } = await db().from('survey_questions').select('id,domain,question_text,response_type,sort_order,is_required,image_path,survey_question_options(id,label,numeric_value,sort_order)').eq('survey_project_id', projectId).order('sort_order')
   if (error) return runFailure('load-questions', '문항을 불러오지 못했습니다.')
-  return (data ?? []).map(q => ({ ...q, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order) })) as RunQuestion[]
+  const imageUrls = await signedQuestionImageUrls((data ?? []).map(question => question.image_path))
+  return (data ?? []).map(q => ({ ...q, image_url:q.image_path ? imageUrls.get(q.image_path) ?? null : null, options:[...q.survey_question_options].sort((a,b)=>a.sort_order-b.sort_order) })) as RunQuestion[]
 }
 
 export async function loadSavedAnswers(submissionId: string): Promise<SavedAnswer[]> {

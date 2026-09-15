@@ -1,6 +1,7 @@
 import type { SurveyTemplate } from '../types/survey'
 
-const question = (domain: string, question_text: string) => ({ domain, question_text, response_type: 'face_5' as const, is_required: true, options: [] })
+// The Nanta presets intentionally retain their established five-point scale.
+const question = (domain: string, question_text: string) => ({ domain, question_text, response_type: 'face_5' as const, is_required: true, options: [], image_path: null })
 export const defaultSurveyTemplates: SurveyTemplate[] = [
   { key: 'blank-single', name: '새 단회 조사', description: '질문을 직접 구성하는 빈 단회 조사', survey_type: 'single', title: '', questions: [] },
   { key: 'blank-pre-post', name: '새 사전·사후 조사', description: '동일 문항으로 전후를 비교하는 빈 조사', survey_type: 'pre_post', title: '', questions: [] },
