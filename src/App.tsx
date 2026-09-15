@@ -14,7 +14,7 @@ export default function App() {
     <Route path="/login" element={<LoginPage />} />
     <Route element={<ProtectedRoute />}><Route element={<AppShell />}>
       <Route index element={<Dashboard />} /><Route path="/admin/new" element={<SurveyEditor />} />
-      <Route path="/surveys" element={<SurveyList />} /><Route path="/surveys/:surveyId/edit" element={<SurveyEditor />} /><Route path="/surveys/run" element={<SurveyRunPage />} /><Route path="/surveys/run/:surveyId/:roundId" element={<SurveyRunPage />} /><Route path="/surveys/run/:surveyId/:roundId/:clientId" element={<SurveyRunPage />} />
+      <Route path="/surveys" element={<SurveyList />} /><Route path="/surveys/:surveyId/edit" element={<SurveyEditor />} /><Route path="/surveys/run" element={<Navigate replace to="/surveys" />} /><Route path="/surveys/run/:surveyId/:roundId" element={<SurveyRunPage />} /><Route path="/surveys/run/:surveyId/:roundId/:clientId" element={<SurveyRunPage />} />
       <Route path="/records" element={<RecordsPage />} /><Route path="/records/:surveyId" element={<RecordsPage />} />
       <Route path="/surveys/completion" element={<Navigate replace to="/records?tab=completion" />} /><Route path="/surveys/:surveyId/completion" element={<LegacyRecordRedirect tab="completion" />} /><Route path="/surveys/search" element={<Navigate replace to="/records" />} />
       <Route path="/reports" element={<Navigate replace to="/records?tab=analysis" />} /><Route path="/reports/:surveyId" element={<LegacyRecordRedirect tab="analysis" />} /><Route path="/reports/print" element={<PrintReportPage />} /><Route path="/reports/:surveyId/print" element={<PrintReportPage />} />
