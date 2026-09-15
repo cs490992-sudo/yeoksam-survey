@@ -38,16 +38,17 @@ type PersonReport = {
 
 const roundLabels = { single: '단회조사', pre: '사전조사', post: '사후조사' } as const
 const fiveLabels = ['매우 어려워요', '어려워요', '보통이에요', '좋아요', '매우 좋아요']
-const threeLabels = ['싫어요', '몰라요', '좋아요']
+const threeLabels = ['싫어요', '몰라요', '네']
 const threeMarkers = ['✕', '?', '○']
 const centerLogoUrl = 'https://yeoksam-attendance1.vercel.app/branding/yeoksam-center-logo.png'
 
 function numericLabel(question: Question, value: number | null) {
   if (value === null || value === undefined) return '무응답'
-  if (question.response_type === 'face_3' || question.response_type === 'scale_3') {
+  if (question.response_type === 'face_3') {
     const index = Math.round(Number(value)) - 1
     return threeLabels[index] ? `${threeLabels[index]} (${value}점)` : `${value}점`
   }
+  if (question.response_type === 'scale_3') return `${value}점`
   if (question.response_type === 'face_5' || question.response_type === 'scale_5') {
     const index = Math.round(Number(value)) - 1
     return fiveLabels[index] ? `${fiveLabels[index]} (${value}점)` : `${value}점`
