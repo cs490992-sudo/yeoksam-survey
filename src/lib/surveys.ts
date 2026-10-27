@@ -287,6 +287,12 @@ export async function closeSurveyRound(roundId:string){
   return data[0] as {survey_round_id:string;round_status:'closed';project_status:'open'|'closed';ended_at:string;already_closed:boolean}
 }
 
+export async function transitionPreToPostSurvey(projectId:string){
+  const {data,error}=await db().rpc('transition_pre_to_post_survey',{p_survey_project_id:projectId})
+  if(error||!data?.[0])return runFailure('transition-pre-to-post',error?.message||'사전·사후 단계 전환에 실패했습니다. 현재 상태를 새로고침한 뒤 다시 확인해 주세요.')
+  return data[0] as {pre_round_id:string;post_round_id:string;transitioned_at:string}
+}
+
 export async function openPostSurveyRound(projectId:string){
   const {data,error}=await db().rpc('open_post_survey_round',{p_survey_project_id:projectId})
   if(error||!data?.[0])return runFailure('open-post-round',error?.message||'사후 조사를 시작하지 못했습니다.')
